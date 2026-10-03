@@ -7,6 +7,7 @@ Softmax CUDA kernels optimized step by step (naive → shared memory → warp sh
 ```python
 !git clone https://github.com/<you>/softmax-cuda.git
 %cd softmax-cuda
+!pip install -q ninja
 !python tests/test_correctness.py
 ```
 
