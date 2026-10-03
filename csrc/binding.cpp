@@ -7,6 +7,7 @@
 torch::Tensor softmax_v1_cuda(torch::Tensor x);
 torch::Tensor softmax_v2_cuda(torch::Tensor x);
 torch::Tensor softmax_v3_cuda(torch::Tensor x);
+torch::Tensor softmax_v4_cuda(torch::Tensor x);
 
 // Every kernel assumes a 2D, contiguous, float32 tensor on the GPU.
 // Checking here turns a silent wrong answer or crash into a clear Python error.
@@ -32,8 +33,14 @@ torch::Tensor softmax_v3(torch::Tensor x) {
     return softmax_v3_cuda(x);
 }
 
+torch::Tensor softmax_v4(torch::Tensor x) {
+    check_input(x);
+    return softmax_v4_cuda(x);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("softmax_v1", &softmax_v1, "Softmax V1: naive, one thread per row");
     m.def("softmax_v2", &softmax_v2, "Softmax V2: block per row, shared-memory reduction");
     m.def("softmax_v3", &softmax_v3, "Softmax V3: block per row, warp-shuffle reduction");
+    m.def("softmax_v4", &softmax_v4, "Softmax V4: fused online softmax (2 reads)");
 }

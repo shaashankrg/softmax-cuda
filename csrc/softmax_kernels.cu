@@ -5,6 +5,7 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <cfloat>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
@@ -209,6 +210,86 @@ torch::Tensor softmax_v3_cuda(torch::Tensor x) {
     if (x.numel() == 0) return y;
 
     softmax_v3_kernel<<<rows, V3_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), y.data_ptr<float>(), cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+// ---------------------------------------------------------------------------
+// V4: fused online softmax (max and sum in one pass)
+// ---------------------------------------------------------------------------
+
+constexpr int V4_THREADS = 256;
+constexpr int V4_WARPS = V4_THREADS / 32;
+
+// Running state of online softmax over some set of elements:
+//   m = max of the elements seen so far
+//   d = sum of exp(x - m) over those elements
+struct MD {
+    float m;
+    float d;
+};
+
+// Merge the states of two disjoint sets of elements. Each d is rescaled to the
+// shared max before adding, so the result is exactly the state of the union.
+__device__ __forceinline__ MD md_combine(MD a, MD b) {
+    const float m = fmaxf(a.m, b.m);
+    return {m, a.d * __expf(a.m - m) + b.d * __expf(b.m - m)};
+}
+
+__device__ __forceinline__ MD warp_md(MD v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        MD other = {__shfl_xor_sync(FULL_MASK, v.m, offset),
+                    __shfl_xor_sync(FULL_MASK, v.d, offset)};
+        v = md_combine(v, other);
+    }
+    return v;
+}
+
+__device__ __forceinline__ MD block_md(MD v, MD* smem) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    v = warp_md(v);
+    if (lane == 0) smem[warp] = v;
+    __syncthreads();
+    v = (lane < V4_WARPS) ? smem[lane] : MD{-FLT_MAX, 0.0f};
+    return warp_md(v);
+}
+
+__global__ void softmax_v4_kernel(const float* __restrict__ x,
+                                  float* __restrict__ y,
+                                  int cols) {
+    __shared__ MD smem[V4_WARPS];
+
+    const int tid = threadIdx.x;
+    const float* x_row = x + (size_t)blockIdx.x * cols;
+    float* y_row = y + (size_t)blockIdx.x * cols;
+
+    // Pass 1: running max and running sum together, one read of the row.
+    // -FLT_MAX, not -INFINITY: if a thread has no elements, combining two
+    // empty states must give exp(-FLT_MAX - -FLT_MAX) = exp(0), not exp(NaN).
+    MD state = {-FLT_MAX, 0.0f};
+    for (int c = tid; c < cols; c += V4_THREADS) {
+        const float v = x_row[c];
+        const float new_m = fmaxf(state.m, v);
+        state.d = state.d * __expf(state.m - new_m) + __expf(v - new_m);
+        state.m = new_m;
+    }
+    const MD row = block_md(state, smem);
+
+    // Pass 2: normalize and write (second and final read of the row)
+    for (int c = tid; c < cols; c += V4_THREADS) {
+        y_row[c] = __expf(x_row[c] - row.m) / row.d;
+    }
+}
+
+torch::Tensor softmax_v4_cuda(torch::Tensor x) {
+    const int rows = x.size(0);
+    const int cols = x.size(1);
+    auto y = torch::empty_like(x);
+    if (x.numel() == 0) return y;
+
+    softmax_v4_kernel<<<rows, V4_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         x.data_ptr<float>(), y.data_ptr<float>(), cols);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
