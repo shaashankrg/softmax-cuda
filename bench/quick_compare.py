@@ -11,17 +11,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from load_ext import load_ext  # noqa: E402
 
 
-def time_ms(fn, x, warmup=10, iters=100):
+def time_ms(fn, x, warmup=10, iters=100, trials=7):
     for _ in range(warmup):  # first calls include one-time setup costs
         fn(x)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn(x)
-    end.record()
-    torch.cuda.synchronize()  # kernel launches are async; wait before reading the timer
-    return start.elapsed_time(end) / iters
+    times = []
+    for _ in range(trials):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            fn(x)
+        end.record()
+        torch.cuda.synchronize()  # kernel launches are async; wait before reading the timer
+        times.append(start.elapsed_time(end) / iters)
+    # Median of several trials: one slow trial (clock change, background work) can't skew it.
+    return sorted(times)[len(times) // 2]
 
 
 if __name__ == "__main__":

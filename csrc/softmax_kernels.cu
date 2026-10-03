@@ -6,6 +6,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
@@ -256,6 +257,17 @@ __device__ __forceinline__ MD block_md(MD v, MD* smem) {
     return warp_md(v);
 }
 
+// Online-softmax update: fold one new element into the running state.
+__device__ __forceinline__ void md_update(MD& state, float v) {
+    const float new_m = fmaxf(state.m, v);
+    state.d = state.d * __expf(state.m - new_m) + __expf(v - new_m);
+    state.m = new_m;
+}
+
+// VEC = true: each thread loads 4 floats at once (one 128-bit float4 load).
+// Requires cols % 4 == 0 and a 16-byte-aligned base pointer; the launcher
+// checks this and falls back to VEC = false otherwise.
+template <bool VEC>
 __global__ void softmax_v4_kernel(const float* __restrict__ x,
                                   float* __restrict__ y,
                                   int cols) {
@@ -269,17 +281,42 @@ __global__ void softmax_v4_kernel(const float* __restrict__ x,
     // -FLT_MAX, not -INFINITY: if a thread has no elements, combining two
     // empty states must give exp(-FLT_MAX - -FLT_MAX) = exp(0), not exp(NaN).
     MD state = {-FLT_MAX, 0.0f};
-    for (int c = tid; c < cols; c += V4_THREADS) {
-        const float v = x_row[c];
-        const float new_m = fmaxf(state.m, v);
-        state.d = state.d * __expf(state.m - new_m) + __expf(v - new_m);
-        state.m = new_m;
+    if constexpr (VEC) {
+        const float4* x4 = reinterpret_cast<const float4*>(x_row);
+        for (int i = tid; i < cols / 4; i += V4_THREADS) {
+            const float4 v = x4[i];
+            // Max of the 4 first (cheap, independent), then ONE rescale of d.
+            const float new_m = fmaxf(state.m, fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w)));
+            state.d = state.d * __expf(state.m - new_m)
+                    + __expf(v.x - new_m) + __expf(v.y - new_m)
+                    + __expf(v.z - new_m) + __expf(v.w - new_m);
+            state.m = new_m;
+        }
+    } else {
+        for (int c = tid; c < cols; c += V4_THREADS) {
+            md_update(state, x_row[c]);
+        }
     }
     const MD row = block_md(state, smem);
+    const float inv_d = 1.0f / row.d;  // one divide per thread, then multiplies
 
     // Pass 2: normalize and write (second and final read of the row)
-    for (int c = tid; c < cols; c += V4_THREADS) {
-        y_row[c] = __expf(x_row[c] - row.m) / row.d;
+    if constexpr (VEC) {
+        const float4* x4 = reinterpret_cast<const float4*>(x_row);
+        float4* y4 = reinterpret_cast<float4*>(y_row);
+        for (int i = tid; i < cols / 4; i += V4_THREADS) {
+            const float4 v = x4[i];
+            float4 out;
+            out.x = __expf(v.x - row.m) * inv_d;
+            out.y = __expf(v.y - row.m) * inv_d;
+            out.z = __expf(v.z - row.m) * inv_d;
+            out.w = __expf(v.w - row.m) * inv_d;
+            y4[i] = out;
+        }
+    } else {
+        for (int c = tid; c < cols; c += V4_THREADS) {
+            y_row[c] = __expf(x_row[c] - row.m) * inv_d;
+        }
     }
 }
 
@@ -289,8 +326,19 @@ torch::Tensor softmax_v4_cuda(torch::Tensor x) {
     auto y = torch::empty_like(x);
     if (x.numel() == 0) return y;
 
-    softmax_v4_kernel<<<rows, V4_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        x.data_ptr<float>(), y.data_ptr<float>(), cols);
+    const float* x_ptr = x.data_ptr<float>();
+    float* y_ptr = y.data_ptr<float>();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // float4 needs every row start 16-byte aligned: base aligned + cols % 4 == 0.
+    const bool can_vec = cols % 4 == 0 &&
+                         reinterpret_cast<uintptr_t>(x_ptr) % 16 == 0 &&
+                         reinterpret_cast<uintptr_t>(y_ptr) % 16 == 0;
+    if (can_vec) {
+        softmax_v4_kernel<true><<<rows, V4_THREADS, 0, stream>>>(x_ptr, y_ptr, cols);
+    } else {
+        softmax_v4_kernel<false><<<rows, V4_THREADS, 0, stream>>>(x_ptr, y_ptr, cols);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }

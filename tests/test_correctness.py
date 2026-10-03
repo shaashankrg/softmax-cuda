@@ -35,6 +35,15 @@ def check(fn, name):
         all_ok &= ok
         print(f"  {'PASS' if ok else 'FAIL'}  {name}  shape={str(shape):<13} "
               f"scale={scale:<6} max_abs_err={max_err:.2e}")
+
+    # Contiguous but starting 4 bytes into its buffer: not 16-byte aligned, so
+    # kernels with float4 loads must detect it and take their scalar path.
+    x = (torch.randn(128 * 1024 + 1, device="cuda") * 10)[1:].view(128, 1024)
+    out, ref = fn(x), torch.softmax(x, dim=-1)
+    ok = torch.allclose(out, ref, atol=1e-5, rtol=1e-4)
+    all_ok &= ok
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}  misaligned (128, 1024) "
+          f"max_abs_err={(out - ref).abs().max().item():.2e}")
     return all_ok
 
 
