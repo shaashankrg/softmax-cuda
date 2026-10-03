@@ -122,3 +122,94 @@ torch::Tensor softmax_v2_cuda(torch::Tensor x) {
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
+
+// ---------------------------------------------------------------------------
+// V3: one block per row + warp-shuffle reductions
+// ---------------------------------------------------------------------------
+
+constexpr unsigned FULL_MASK = 0xffffffff;  // all 32 lanes of the warp participate
+constexpr int V3_THREADS = 256;
+constexpr int V3_WARPS = V3_THREADS / 32;   // 8 warps per block
+
+// Reduce 32 values held in registers (one per lane) in 5 steps.
+// After the loop, every lane holds the result (butterfly pattern).
+__device__ __forceinline__ float warp_max(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(FULL_MASK, v, offset));
+    }
+    return v;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_xor_sync(FULL_MASK, v, offset);
+    }
+    return v;
+}
+
+// Block-wide reductions: warp-reduce, lane 0 of each warp parks its result in
+// shared memory, then every warp reduces those 8 values itself so the final
+// answer ends up in all 256 threads without a second trip through shared memory.
+__device__ __forceinline__ float block_max(float v, float* smem) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    v = warp_max(v);
+    if (lane == 0) smem[warp] = v;
+    __syncthreads();  // all 8 warp results written before anyone reads them
+    v = (lane < V3_WARPS) ? smem[lane] : -INFINITY;
+    return warp_max(v);
+}
+
+__device__ __forceinline__ float block_sum(float v, float* smem) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    v = warp_sum(v);
+    if (lane == 0) smem[warp] = v;
+    __syncthreads();
+    v = (lane < V3_WARPS) ? smem[lane] : 0.0f;
+    return warp_sum(v);
+}
+
+__global__ void softmax_v3_kernel(const float* __restrict__ x,
+                                  float* __restrict__ y,
+                                  int cols) {
+    // Separate buffers for max and sum, so a fast warp writing its partial sum
+    // can never overwrite a partial max that a slow warp hasn't read yet.
+    __shared__ float smem_max[V3_WARPS];
+    __shared__ float smem_sum[V3_WARPS];
+
+    const int tid = threadIdx.x;
+    const float* x_row = x + (size_t)blockIdx.x * cols;
+    float* y_row = y + (size_t)blockIdx.x * cols;
+
+    // Pass 1: max
+    float local_max = -INFINITY;
+    for (int c = tid; c < cols; c += V3_THREADS) {
+        local_max = fmaxf(local_max, x_row[c]);
+    }
+    const float row_max = block_max(local_max, smem_max);
+
+    // Pass 2: sum of exp(x - max)
+    float local_sum = 0.0f;
+    for (int c = tid; c < cols; c += V3_THREADS) {
+        local_sum += expf(x_row[c] - row_max);
+    }
+    const float row_sum = block_sum(local_sum, smem_sum);
+
+    // Pass 3: normalize and write
+    for (int c = tid; c < cols; c += V3_THREADS) {
+        y_row[c] = expf(x_row[c] - row_max) / row_sum;
+    }
+}
+
+torch::Tensor softmax_v3_cuda(torch::Tensor x) {
+    const int rows = x.size(0);
+    const int cols = x.size(1);
+    auto y = torch::empty_like(x);
+    if (x.numel() == 0) return y;
+
+    softmax_v3_kernel<<<rows, V3_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), y.data_ptr<float>(), cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
