@@ -1,0 +1,16 @@
+{
+  "model": "unsloth/Llama-3.2-1B",
+  "gpu": "Tesla T4",
+  "kernel_calls_per_forward": 16,
+  "logits_max_abs_diff": 4.9591064453125e-05,
+  "logits_allclose": true,
+  "generated_identical": true,
+  "generate_kernel_calls": 800,
+  "batch": 4,
+  "seq_len": 2048,
+  "torch_ms": 6065.06,
+  "ours_ms": 6047.35,
+  "speedup_pct": 0.29,
+  "softmax_share_torch_pct": 5.15,
+  "softmax_share_ours_pct": 4.66
+}

@@ -21,3 +21,10 @@
 2. Caching medium rows in shared memory so the second pass doesn't go back to global memory.
 3. Profiling V4 at 4096×4096 with Nsight Compute to find the actual cause.
 4. float16/bfloat16 support, which halves the bytes moved.
+
+## Llama 3.2 1B (float32, eager attention, batch 4 × 2048 tokens)
+
+- **Correctness:** V4 ran in all 16 attention layers (800 calls while generating 50 tokens). Logits match PyTorch to within 5.0e-5, and the generated text is identical.
+- **Softmax share of GPU time:** 5.15% with PyTorch's softmax, 4.66% with V4. Softmax time is about 312 ms vs. 282 ms, so V4 is roughly 10% faster inside the model.
+- **End-to-end:** 6065 ms → 6047 ms, a +0.29% speedup. That's likely within run-to-run noise.
+- **Amdahl's law:** even an infinitely fast softmax could only give 1 / (1 − 0.0515) = 5.4% overall.
