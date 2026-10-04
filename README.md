@@ -24,7 +24,7 @@ V4's speed relative to PyTorch depends on row length: **60%** at 512 columns, **
 
 - **V1:** each thread handles one whole row. The 32 threads in a warp read addresses one row apart, so memory reads are uncoalesced, and there are too few threads to keep the GPU busy.
 - **V2:** a block of 256 threads shares each row. Neighboring threads read neighboring addresses (coalesced), and a shared-memory tree combines the 256 partial results in 8 steps.
-- **V3:** warps combine values directly between registers with `__shfl_xor_sync`. That cuts barriers per row from 18 to 2.
+- **V3:** warps combine values directly between registers with `__shfl_xor_sync`. That cuts barriers per row from 19 to 2.
 - **V4:** online softmax computes the max and the sum in a single pass, so each row is read from memory 2 times instead of 3. 128-bit `float4` loads cut the number of load instructions by 4×.
 
 ## Run it
