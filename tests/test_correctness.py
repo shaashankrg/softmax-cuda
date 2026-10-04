@@ -44,6 +44,19 @@ def check(fn, name):
     all_ok &= ok
     print(f"  {'PASS' if ok else 'FAIL'}  {name}  misaligned (128, 1024) "
           f"max_abs_err={(out - ref).abs().max().item():.2e}")
+
+    # Causal attention mask: row i may only see columns 0..i; the rest are filled
+    # with -inf or the most negative float, like Llama's attention mask does.
+    # Row 0 has a single visible element, so its output must be exactly [1, 0, 0, ...].
+    x = torch.randn(256, 1024, device="cuda") * 10
+    hidden = torch.ones(256, 1024, dtype=torch.bool, device="cuda").triu(diagonal=1)
+    for fill_name, fill in (("-inf", float("-inf")), ("finfo.min", torch.finfo(torch.float32).min)):
+        xm = x.masked_fill(hidden, fill)
+        out, ref = fn(xm), torch.softmax(xm, dim=-1)
+        ok = torch.allclose(out, ref, atol=1e-5, rtol=1e-4)
+        all_ok &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}  causal mask ({fill_name:<9}) "
+              f"max_abs_err={(out - ref).abs().max().item():.2e}")
     return all_ok
 
 
